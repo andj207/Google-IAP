@@ -8,6 +8,10 @@ import com.android.billingclient.api.BillingClient.BillingResponseCode.*
 import com.android.billingclient.api.BillingClient.FeatureType.SUBSCRIPTIONS
 import com.android.billingclient.api.BillingClient.SkuType.INAPP
 import com.android.billingclient.api.BillingClient.SkuType.SUBS
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import timber.log.Timber
 
 /**
  * Wrapper class for Google In-App purchases.
@@ -71,12 +75,27 @@ class IapConnector(context: Context, private val base64Key: String) {
     fun makePurchase(activity: Activity, sku: String) {
         if (fetchedSkuDetailsList.isEmpty())
             inAppEventsListener?.onError(this, DataWrappers.BillingResponse("Products not fetched"))
-        else
-            iapClient.launchBillingFlow(
-                activity,
-                BillingFlowParams.newBuilder()
-                    .setSkuDetails(fetchedSkuDetailsList.find { it.sku == sku }!!).build()
-            )
+        else {
+            val skuInfo = fetchedSkuDetailsList.firstOrNull { it.sku == sku }
+            if (skuInfo != null) {
+                val result = iapClient.launchBillingFlow(
+                    activity,
+                    BillingFlowParams.newBuilder()
+                        .setSkuDetails(skuInfo).build()
+                )
+                if (result.responseCode != 0) {
+                    inAppEventsListener?.onError(
+                        this,
+                        DataWrappers.BillingResponse("Billing flow error")
+                    )
+                }
+            } else {
+                inAppEventsListener?.onError(
+                    this,
+                    DataWrappers.BillingResponse("Product not found")
+                )
+            }
+        }
     }
 
     /**
@@ -109,7 +128,7 @@ class IapConnector(context: Context, private val base64Key: String) {
                         }
                     )
                     SERVICE_DISCONNECTED -> connect()
-                    else -> Log.i(tag, "Purchase update : ${billingResult.debugMessage}")
+                    else -> Timber.d("Purchase update : ${billingResult.debugMessage}")
                 }
             }.build()
     }
@@ -118,29 +137,37 @@ class IapConnector(context: Context, private val base64Key: String) {
      * Connects billing client with Play console to start working with IAP.
      */
     fun connect(): IapConnector {
-        Log.d(tag, "Billing service : Connecting...")
+        Timber.d("Billing service : Connecting...")
         if (!iapClient.isReady) {
             iapClient.startConnection(object : BillingClientStateListener {
                 override fun onBillingServiceDisconnected() {
-                    inAppEventsListener?.onError(
-                        this@IapConnector,
-                        DataWrappers.BillingResponse("Billing service : Disconnected")
-                    )
+                    inAppEventsListener?.onServiceConnect(false)
                 }
 
                 override fun onBillingSetupFinished(billingResult: BillingResult) {
                     when (billingResult.responseCode) {
                         OK -> {
-                            Log.d(tag, "Billing service : Connected")
-                            inAppIds?.let {
-                                querySku(INAPP, it)
-                            }
-                            subIds?.let {
-                                querySku(SUBS, it)
+                            Timber.d("Billing service : Connected")
+                            GlobalScope.launch(Dispatchers.IO) {
+                                querySkuList()
+                                inAppEventsListener?.onInAppProductsFetched(
+                                    fetchedSkuDetailsList.map {
+                                        getSkuInfo(it).also { si ->
+                                            si.isConsumable = consumableIds.contains(si.sku)
+                                        }
+                                    }
+                                )
+                                inAppEventsListener?.onServiceConnect(true)
                             }
                         }
-                        BILLING_UNAVAILABLE -> Log.d(tag, "Billing service : Unavailable")
-                        else -> Log.d(tag, "Billing service : Setup error")
+                        BILLING_UNAVAILABLE -> {
+                            Timber.d("Billing service : Unavailable")
+                            inAppEventsListener?.onServiceConnect(false)
+                        }
+                        else -> {
+                            Timber.d("Billing service : Setup error")
+                            inAppEventsListener?.onServiceConnect(false)
+                        }
                     }
                 }
             })
@@ -148,56 +175,49 @@ class IapConnector(context: Context, private val base64Key: String) {
         return this
     }
 
+    fun disconnect() {
+        iapClient.endConnection()
+    }
+
+    fun isInitialized(): Boolean {
+        return iapClient.isReady
+    }
+
     /**
      * Fires a query in Play console to get [SkuDetails] for provided type and IDs.
      */
-    private fun querySku(skuType: String, ids: List<String>) {
-        iapClient.querySkuDetailsAsync(
-            SkuDetailsParams.newBuilder()
-                .setSkusList(ids).setType(skuType).build()
-        ) { billingResult, skuDetailsList ->
-            when (billingResult.responseCode) {
-                OK -> {
-                    if (skuDetailsList!!.isEmpty()) {
-                        Log.d(tag, "Query SKU : Data not found (List empty)")
-                        inAppEventsListener?.onError(
-                            this,
-                            billingResult.run {
-                                DataWrappers.BillingResponse(
-                                    debugMessage,
-                                    responseCode
-                                )
-                            })
-                    } else {
-                        Log.d(tag, "Query SKU : Data found")
+    private suspend fun querySkuList() {
+        var skuResult = inAppIds?.let {
+            iapClient.querySkuDetails(
+                SkuDetailsParams.newBuilder()
+                    .setSkusList(it).setType(INAPP).build()
+            )
+        }
 
-                        fetchedSkuDetailsList.addAll(skuDetailsList)
+        skuResult?.skuDetailsList?.let {
+            fetchedSkuDetailsList.addAll(it)
+        }
 
-                        val fetchedSkuInfo = skuDetailsList.map {
-                            getSkuInfo(it)
-                        }
+        skuResult?.billingResult?.let {
+            if (it.responseCode != 0) {
+                Timber.e("Billing query INAPP sku list error ${it.debugMessage}")
+            }
+        }
 
-                        if (skuType == SUBS)
-                            inAppEventsListener?.onSubscriptionsFetched(fetchedSkuInfo)
-                        else
-                            inAppEventsListener?.onInAppProductsFetched(fetchedSkuInfo.map {
-                                it.isConsumable = consumableIds.contains(it.sku)
-                                it
-                            })
-                    }
-                }
-                else -> {
-                    Log.d(tag, "Query SKU : Failed")
-                    inAppEventsListener?.onError(
-                        this,
-                        billingResult.run {
-                            DataWrappers.BillingResponse(
-                                debugMessage,
-                                responseCode
-                            )
-                        }
-                    )
-                }
+        skuResult = subIds?.let {
+            iapClient.querySkuDetails(
+                SkuDetailsParams.newBuilder()
+                    .setSkusList(it).setType(SUBS).build()
+            )
+        }
+
+        skuResult?.skuDetailsList?.let {
+            fetchedSkuDetailsList.addAll(it)
+        }
+
+        skuResult?.billingResult?.let {
+            if (it.responseCode != 0) {
+                Timber.e("Billing query SUBS sku list error ${it.debugMessage}")
             }
         }
     }
@@ -230,9 +250,9 @@ class IapConnector(context: Context, private val base64Key: String) {
     fun getAllPurchases() {
         if (iapClient.isReady) {
             val allPurchases = mutableListOf<Purchase>()
-            allPurchases.addAll(iapClient.queryPurchases(INAPP).purchasesList!!)
+            iapClient.queryPurchases(INAPP).purchasesList?.let { allPurchases.addAll(it) }
             if (isSubSupportedOnDevice())
-                allPurchases.addAll(iapClient.queryPurchases(SUBS).purchasesList!!)
+                iapClient.queryPurchases(SUBS).purchasesList?.let { allPurchases.addAll(it) }
             processPurchases(allPurchases)
         } else {
             inAppEventsListener?.onError(
@@ -248,10 +268,10 @@ class IapConnector(context: Context, private val base64Key: String) {
     private fun processPurchases(allPurchases: List<Purchase>) {
         if (allPurchases.isNotEmpty()) {
             val validPurchases = allPurchases.filter {
-                isPurchaseSignatureValid(it)
+                isPurchaseSignatureValid(it) && fetchedSkuDetailsList.any { skuInfo -> skuInfo.sku == it.sku }
             }.map { purchase ->
                 DataWrappers.PurchaseInfo(
-                    getSkuInfo(fetchedSkuDetailsList.find { it.sku == purchase.sku }!!),
+                    getSkuInfo(fetchedSkuDetailsList.first { it.sku == purchase.sku }),
                     purchase.purchaseState,
                     purchase.developerPayload,
                     purchase.isAcknowledged,
@@ -273,6 +293,8 @@ class IapConnector(context: Context, private val base64Key: String) {
                 validPurchases.forEach {
                     acknowledgePurchase(it)
                 }
+        } else {
+            inAppEventsListener?.onProductsPurchased(emptyList())
         }
     }
 
@@ -289,14 +311,11 @@ class IapConnector(context: Context, private val base64Key: String) {
                 iapClient.consumeAsync(
                     ConsumeParams.newBuilder()
                         .setPurchaseToken(purchaseToken).build()
-                ) { billingResult, purchaseToken ->
+                ) { billingResult, _ ->
                     when (billingResult.responseCode) {
                         OK -> inAppEventsListener?.onPurchaseAcknowledged(this)
                         else -> {
-                            Log.d(
-                                tag,
-                                "Handling consumables : Error -> ${billingResult.debugMessage}"
-                            )
+                            Timber.d("Handling consumables : Error -> ${billingResult.debugMessage}")
                             inAppEventsListener?.onError(
                                 this@IapConnector,
                                 billingResult.run {
@@ -317,10 +336,7 @@ class IapConnector(context: Context, private val base64Key: String) {
                     when (billingResult.responseCode) {
                         OK -> inAppEventsListener?.onPurchaseAcknowledged(this)
                         else -> {
-                            Log.d(
-                                tag,
-                                "Handling non consumables : Error -> ${billingResult.debugMessage}"
-                            )
+                            Timber.d("Handling non consumables : Error -> ${billingResult.debugMessage}")
                             inAppEventsListener?.onError(
                                 this@IapConnector,
                                 billingResult.run {
@@ -344,10 +360,10 @@ class IapConnector(context: Context, private val base64Key: String) {
         when (iapClient.isFeatureSupported(SUBSCRIPTIONS).responseCode) {
             OK -> {
                 isSupported = true
-                Log.d(tag, "Subs support check : Success")
+                Timber.d("Subs support check : Success")
             }
             SERVICE_DISCONNECTED -> connect()
-            else -> Log.d(tag, "Subs support check : Error")
+            else -> Timber.d("Subs support check : Error")
         }
         return isSupported
     }
