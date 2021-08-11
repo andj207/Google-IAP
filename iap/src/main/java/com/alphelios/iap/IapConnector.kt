@@ -151,7 +151,7 @@ class IapConnector(context: Context, private val base64Key: String) {
                             GlobalScope.launch(Dispatchers.IO) {
                                 querySkuList()
                                 inAppEventsListener?.onInAppProductsFetched(
-                                    fetchedSkuDetailsList.map {
+                                    fetchedSkuDetailsList.toMutableList().map {
                                         getSkuInfo(it).also { si ->
                                             si.isConsumable = consumableIds.contains(si.sku)
                                         }
